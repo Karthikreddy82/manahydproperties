@@ -2,14 +2,15 @@ name: Build, Push to ECR, and Deploy to EC2
 
 on:
   push:
-    branches: [ "main" ]
+    branches:
+      - main
 
 env:
+  AWS_REGION: ap-south-1
   ECR_REPOSITORY: manahydproperties
 
 jobs:
-  build-and-push:
-    name: Build & Push Image
+  build-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
@@ -21,7 +22,7 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Log in to Amazon ECR
         id: login-ecr
@@ -32,26 +33,33 @@ jobs:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build -t $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker tag $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $REGISTRY/$ECR_REPOSITORY:latest
+          docker build -t $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -t $REGISTRY/$ECR_REPOSITORY:latest .
           docker push $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           docker push $REGISTRY/$ECR_REPOSITORY:latest
 
-  deploy:
-    name: Deploy to EC2
-    needs: build-and-push
-    runs-on: ubuntu-latest
-
-    steps:
       - name: Deploy to EC2 via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
+          username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
-            aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin 003713966273.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
-            docker pull 003713966273.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:latest
-            docker stop manahyd-app || true
-            docker rm manahyd-app || true
-            docker run -d -p 80:80 --name manahyd-app 003713966273.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:latest
+            # 1. Obtain Account ID and authenticate Docker against ECR using the instance IAM role
+            ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+            aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.ap-south-1.amazonaws.com
+
+            # 2. Pull the latest build
+            docker pull ${ACCOUNT_ID}.dkr.ecr.ap-south-1.amazonaws.com/${{ env.ECR_REPOSITORY }}:latest
+
+            # 3. Stop and replace the running container
+            docker stop web-app || true
+            docker rm web-app || true
+
+            docker run -d \
+              --name web-app \
+              --restart unless-stopped \
+              -p 80:80 \
+              ${ACCOUNT_ID}.dkr.ecr.ap-south-1.amazonaws.com/${{ env.ECR_REPOSITORY }}:latest
+
+            # 4. Clean up dangling images to prevent disk fill-up
+            docker image prune -af
